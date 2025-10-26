@@ -30,6 +30,10 @@ $MinNodeVersion = [version]'24.10.0'
 $MinPythonVersion = [version]'3.14.0'
 $EventSource = "Suno Automation Setup"
 
+# NVM Configuration
+$NvmVersion = "1.1.12"
+$NvmDownloadUrl = "https://github.com/coreybutler/nvm-windows/releases/download/$NvmVersion/nvm-setup.exe"
+
 # --- Path and Logging Initialization ---
 # Use $PSScriptRoot for reliable, portable pathing.
 $ScriptRoot = $PSScriptRoot
@@ -94,33 +98,52 @@ function Run-Exe {
         [string[]]$ArgumentList = @(),
         [string]$SuccessMessage = "",
         [string]$FailureMessage = "",
-        [switch]$ContinueOnError
+        [switch]$ContinueOnError,
+        [switch]$AttachConsole   # NEW: Allow console-attached execution
     )
     Write-Log "Executing: $FilePath $($ArgumentList -join ' ')" "DEBUG"
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $FilePath
-        $psi.RedirectStandardError = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
+
+        if ($AttachConsole) {
+            # Share current console and DO NOT redirect.
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $false
+            $psi.RedirectStandardError  = $false
+            $psi.CreateNoWindow = $true   # don't spawn a new console
+        } else {
+            # Old behavior: capture output for logging.
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError  = $true
+            $psi.CreateNoWindow = $true
+        }
+
         foreach ($arg in $ArgumentList) { [void]$psi.ArgumentList.Add($arg) }
+
         $p = New-Object System.Diagnostics.Process
         $p.StartInfo = $psi
         $null = $p.Start()
-        $stdout = $p.StandardOutput.ReadToEnd()
-        $stderr = $p.StandardError.ReadToEnd()
+        if (-not $AttachConsole) {
+            $stdout = $p.StandardOutput.ReadToEnd()
+            $stderr = $p.StandardError.ReadToEnd()
+        }
         $p.WaitForExit()
         $code = $p.ExitCode
         if ($code -eq 0) {
             if ($SuccessMessage) { Write-Log $SuccessMessage "SUCCESS" }
-            if ($stdout.Trim()) { Write-Log "Out: $($stdout.Trim())" "DEBUG" }
-            if ($stderr.Trim()) { Write-Log "Err: $($stderr.Trim())" "DEBUG" }
+            if (-not $AttachConsole) {
+                if ($stdout.Trim()) { Write-Log "Out: $($stdout.Trim())" "DEBUG" }
+                if ($stderr.Trim()) { Write-Log "Err: $($stderr.Trim())" "DEBUG" }
+            }
             return $true
         } else {
             Write-Log "$FailureMessage (Exit Code: $code)" "ERROR"
-            if ($stdout.Trim()) { Write-Log "Out: $($stdout.Trim())" "ERROR" }
-            if ($stderr.Trim()) { Write-Log "Err: $($stderr.Trim())" "ERROR" }
+            if (-not $AttachConsole) {
+                if ($stdout.Trim()) { Write-Log "Out: $($stdout.Trim())" "ERROR" }
+                if ($stderr.Trim()) { Write-Log "Err: $($stderr.Trim())" "ERROR" }
+            }
             if (-not $ContinueOnError) {
                 $script:blnSuccess = $false
                 $script:strInstallReport += "$FailureMessage`n"
@@ -219,7 +242,8 @@ function Refresh-PythonPath {
     $pyLocations = @(
         "$env:LocalAppData\Programs\Python\Python314\python.exe",
         "$env:ProgramFiles\Python314\python.exe",
-        "$env:ProgramFiles\Python\Python314\python.exe"
+        "$env:ProgramFiles\Python\Python314\python.exe",
+        "$env:ProgramFiles(x86)\Python314\python.exe"
     )
     
     foreach ($pyExe in $pyLocations) {
@@ -232,22 +256,163 @@ function Refresh-PythonPath {
     }
 }
 
-function Resolve-Python314 {
-    # Prefer py launcher
-    $py = Get-Command "py" -ErrorAction SilentlyContinue
-    if ($py) {
-        try {
-            $exe = & py -3.14 -c "import sys; print(sys.executable)" 2>$null
-            if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path $exe)) { return $exe.Trim() }
-        } catch {}
+function Refresh-EnvironmentPath {
+    Write-Log "Refreshing environment PATH..." "DEBUG"
+    try {
+        $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+        $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+        $env:Path = "$machinePath;$userPath"
+        Write-Log "PATH refreshed successfully." "DEBUG"
+    } catch {
+        Write-Log "Failed to refresh PATH: $($_.Exception.Message)" "WARN"
     }
-    # Fallback: probe common install paths
+}
+
+function Get-NvmPath {
+    $candidates = @(
+        "$env:ProgramFiles\nvm\nvm.exe",
+        "$env:ProgramFiles(x86)\nvm\nvm.exe",
+        "$env:LOCALAPPDATA\Programs\nvm\nvm.exe"
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+    $nvm = Get-Command "nvm" -ErrorAction SilentlyContinue
+    if ($nvm) { return $nvm.Source }
+    return $null
+}
+
+function Ensure-Nvm {
+    $nvm = Get-NvmPath
+    if ($nvm) {
+        Write-Log "NVM detected at: $nvm" "SUCCESS"
+        return $nvm
+    }
+
+    Write-Log "NVM for Windows not found. Installing via Winget..." "INFO"
+    if (-not (Run-Exe -FilePath "winget" -ArgumentList @(
+        "install","-e","--id","CoreyButler.NVMforWindows",
+        "--accept-package-agreements","--accept-source-agreements"
+    ) -SuccessMessage "NVM for Windows installed." -FailureMessage "Failed to install NVM for Windows.")) {
+        return $null
+    }
+
+    # Re-resolve after install
+    $nvm = Get-NvmPath
+    if ($nvm) {
+        Write-Log "NVM installed and resolved at: $nvm" "SUCCESS"
+    } else {
+        Write-Log "NVM install completed but nvm.exe was not found on disk." "ERROR"
+    }
+    return $nvm
+}
+
+function Ensure-Node-WithNvm {
+    param(
+        [Parameter(Mandatory)][string]$TargetNodeVersion # e.g., '24.10.0'
+    )
+
+    # Install/resolve NVM first
+    $nvm = Ensure-Nvm
+    if (-not $nvm) {
+        $script:blnSuccess = $false
+        $script:strInstallReport += "NVM installation failed`n"
+        return
+    }
+
+    # Ensure the NVM symlink directory exists and is on PATH (nvm 'use' points C:\Program Files\nodejs to a specific version)
+    $symlink = "${env:ProgramFiles}\nodejs"
+    if (-not (Test-Path $symlink)) { New-Item -ItemType Directory -Path $symlink -Force | Out-Null }
+    if (-not ($env:Path -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ieq $symlink })) {
+        Write-Log "Adding Node.js symlink to PATH for current session: $symlink" "DEBUG"
+        $env:Path = "$symlink;$env:Path"
+    }
+
+    # If Node already meets min version, keep it
+    $existing = Get-CommandVersion "node" "-v"
+    if ($existing -and $existing -ge [version]'24.10.0') {
+        Write-Log "Node.js is available ($existing) and meets the minimum version." "SUCCESS"
+        return
+    }
+
+    # Install specific Current version (24.10.x). NVM expects full semver; try exact, then minor if needed.
+    $installed = $false
+    foreach ($candidate in @($TargetNodeVersion, ($TargetNodeVersion -replace '\.0$',''))) {
+        Write-Log "Ensuring Node.js $candidate via NVM..." "INFO"
+        # Try install (idempotent if already present)
+        Run-Exe -FilePath $nvm -ArgumentList @("install", $candidate, "64") `
+            -SuccessMessage "Node $candidate downloaded." `
+            -FailureMessage "Failed to download Node $candidate." -ContinueOnError -AttachConsole | Out-Null
+
+        # Select the version
+        if (Run-Exe -FilePath $nvm -ArgumentList @("use", $candidate) `
+            -SuccessMessage "Using Node $candidate." -FailureMessage "Failed to switch to Node $candidate." -ContinueOnError -AttachConsole) {
+            $installed = $true
+            break
+        }
+    }
+
+    if (-not $installed) {
+        Write-Log "NVM could not set Node to the required version ($TargetNodeVersion)." "ERROR"
+        $script:blnSuccess = $false
+        $script:strInstallReport += "Node 24.10+ not available via NVM`n"
+        return
+    }
+
+    # Verify in current process
+    Refresh-NodePath
+    $now = Get-CommandVersion "node" "-v"
+    if (-not $now -or $now -lt [version]'24.10.0') {
+        Write-Log "Node.js is not available at the required version after NVM switch." "ERROR"
+        $script:blnSuccess = $false
+        $script:strInstallReport += "Node 24.10+ unavailable in current session`n"
+    } else {
+        Write-Log "Node.js is available ($now)." "SUCCESS"
+    }
+}
+
+function Resolve-Python314 {
+    Write-Log "Resolving Python 3.14 executable..." "DEBUG"
+    
+    # Method 1: Use py launcher (most reliable)
+    try {
+        $pyLauncher = Get-Command "py" -ErrorAction SilentlyContinue
+        if ($pyLauncher) {
+            $pythonExe = & py -3.14 -c "import sys; print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $pythonExe -and (Test-Path $pythonExe.Trim())) {
+                Write-Log "Resolved Python 3.14 via py launcher: $pythonExe" "DEBUG"
+                return $pythonExe.Trim()
+            }
+        }
+    } catch {
+        Write-Log "py launcher method failed: $($_.Exception.Message)" "DEBUG"
+    }
+    
+    # Method 2: Check common installation paths
     $candidates = @(
         "$env:LocalAppData\Programs\Python\Python314\python.exe",
         "$env:ProgramFiles\Python314\python.exe",
-        "$env:ProgramFiles\Python\Python314\python.exe"
+        "$env:ProgramFiles\Python\Python314\python.exe",
+        "$env:ProgramFiles(x86)\Python314\python.exe"
     )
-    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+    
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            Write-Log "Resolved Python 3.14 at: $candidate" "DEBUG"
+            return $candidate
+        }
+    }
+    
+    # Method 3: Search PATH after refresh
+    Refresh-EnvironmentPath
+    $pythonCmd = Get-Command "python" -ErrorAction SilentlyContinue
+    if ($pythonCmd) {
+        $version = Get-CommandVersion "python" "--version"
+        if ($version -and $version -ge $MinPythonVersion) {
+            Write-Log "Resolved Python $version from PATH: $($pythonCmd.Source)" "DEBUG"
+            return $pythonCmd.Source
+        }
+    }
+    
+    Write-Log "Failed to resolve Python 3.14 executable." "ERROR"
     return $null
 }
 
@@ -255,27 +420,14 @@ function Resolve-Python314 {
 
 function Install-NodeJS {
     Write-Log "Checking Node.js installation..." "INFO"
-    $nodeVersion = Get-CommandVersion "node" "-v"  # handles vX.Y.Z
-    if ($nodeVersion -and $nodeVersion -ge $MinNodeVersion) {
-        Write-Log "Node.js is available ($nodeVersion)." "SUCCESS"
+    $current = Get-CommandVersion "node" "-v"
+    if ($current -and $current -ge [version]'24.10.0') {
+        Write-Log "Node.js is available ($current)." "SUCCESS"
         return
     }
 
-    if (-not (InstallOrUpgrade-Package -Id "OpenJS.NodeJS.LTS" -FriendlyName "Node.js LTS")) {
-        $script:blnSuccess = $false
-        $script:strInstallReport += "Failed to install/upgrade Node.js`n"
-        return
-    }
-
-    Refresh-NodePath
-    $nodeVersion = Get-CommandVersion "node" "-v"
-    if (-not $nodeVersion -or $nodeVersion -lt $MinNodeVersion) {
-        Write-Log "Node.js is not available at required version after install/upgrade." "ERROR"
-        $script:blnSuccess = $false
-        $script:strInstallReport += "Node.js unavailable or below minimum in current session`n"
-    } else {
-        Write-Log "Node.js is available ($nodeVersion)." "SUCCESS"
-    }
+    # Node 24.10+ is a Current line, not LTS. Use NVM for a precise version.
+    Ensure-Node-WithNvm -TargetNodeVersion "24.10.0"
 }
 
 function Install-Python {
@@ -354,9 +506,15 @@ function Ensure-Admin {
 function Setup-Repository {
     Write-Log "Setting up repository at $ProjectRoot..." "INFO"
     
+    # Create parent directory if it doesn't exist
+    $parent = Split-Path -Parent $ProjectRoot
+    if ($parent -and -not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    
     if (Test-Path (Join-Path $ProjectRoot ".git")) {
         Write-Log "Existing repository found. Updating..." "INFO"
-        if (-not (Run-Exe -FilePath "git" -ArgumentList @("-C","`"$ProjectRoot`"","pull") -SuccessMessage "Repository updated successfully." -FailureMessage "Failed to pull updates." -ContinueOnError)) {
+        if (-not (Run-Exe -FilePath "git" -ArgumentList @("-C",$ProjectRoot,"pull") -SuccessMessage "Repository updated successfully." -FailureMessage "Failed to pull updates." -ContinueOnError)) {
             $script:blnSuccess = $false
             $script:strInstallReport += "Failed to pull updates`n"
         }
@@ -366,7 +524,7 @@ function Setup-Repository {
         $script:strInstallReport += "Failed to clone repository - directory exists without .git`n"
     } else {
         Write-Log "No existing repository found. Cloning a fresh copy..." "INFO"
-        if (-not (Run-Exe -FilePath "git" -ArgumentList @("clone","`"$RepoUrl`"","`"$ProjectRoot`"") -SuccessMessage "Repository cloned to $ProjectRoot" -FailureMessage "Failed to clone repository.")) {
+        if (-not (Run-Exe -FilePath "git" -ArgumentList @("clone",$RepoUrl,$ProjectRoot) -SuccessMessage "Repository cloned to $ProjectRoot" -FailureMessage "Failed to clone repository.")) {
             $script:blnSuccess = $false
             $script:strInstallReport += "Failed to clone repository`n"
         }
@@ -400,7 +558,7 @@ function Setup-Backend {
     # Create venv with Python 3.14
     if (-not (Test-Path ".venv")) {
         Write-Log "Creating Python 3.14 virtual environment..." "INFO"
-        if (-not (Run-Exe -FilePath $exe314 -ArgumentList @("-m","venv",".venv") -SuccessMessage "Virtual environment created." -FailureMessage "Failed to create virtual environment.")) {
+        if (-not (Run-Exe -FilePath $exe314 -ArgumentList @("-m", "venv", ".venv") -SuccessMessage "Virtual environment created." -FailureMessage "Failed to create virtual environment.")) {
             Pop-Location
             return
         }
@@ -419,11 +577,11 @@ function Setup-Backend {
     }
 
     # Upgrade pip
-    Run-Exe -FilePath $venvPy -ArgumentList @("-m","pip","install","--upgrade","pip") -SuccessMessage "Pip upgraded." -FailureMessage "Failed to upgrade pip." -ContinueOnError
+    Run-Exe -FilePath $venvPy -ArgumentList @("-m", "pip", "install", "--upgrade", "pip") -SuccessMessage "Pip upgraded." -FailureMessage "Failed to upgrade pip." -ContinueOnError
 
     # Install requirements
     if (Test-Path "requirements.txt") {
-        if (-not (Run-Exe -FilePath $venvPy -ArgumentList @("-m","pip","install","-r","requirements.txt") -SuccessMessage "Python dependencies installed." -FailureMessage "Failed to install Python dependencies.")) {
+        if (-not (Run-Exe -FilePath $venvPy -ArgumentList @("-m", "pip", "install", "-r", "requirements.txt") -SuccessMessage "Python dependencies installed." -FailureMessage "Failed to install Python dependencies.")) {
             Pop-Location
             return
         }

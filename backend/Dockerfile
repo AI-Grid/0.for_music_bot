@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1
+# System: Suno Automation Backend
+# Module: Docker Runtime
+# File URL: backend/Dockerfile
+# Purpose: Build the FastAPI backend container with Camoufox dependencies and health instrumentation.
 
 ARG PYTHON_IMAGE=python:3.11-slim-bookworm
 
@@ -21,7 +25,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install --no-cache-dir --prefix /install -r requirements.txt \
-    && python -m pip install --no-cache-dir "camoufox[geoip]"
+    && python -m pip install --no-cache-dir --prefix /install "camoufox[geoip]"
+
+ENV PYTHONPATH=/install/lib/python3.11/site-packages
 
 COPY build/artifacts/camoufox/ ./artifacts/camoufox/
 RUN set -eux; \
@@ -113,6 +119,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /install /usr/local
 COPY --from=builder /build/camoufox-install /opt/camoufox
 
+# Fix browserforge missing data files by downloading them directly
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+    mkdir -p /usr/local/lib/python3.11/site-packages/browserforge/headers/data && \
+    mkdir -p /usr/local/lib/python3.11/site-packages/browserforge/fingerprints/data && \
+    cd /usr/local/lib/python3.11/site-packages/browserforge/headers/data && \
+    curl -L -O https://github.com/daijro/browserforge/raw/main/browserforge/headers/data/input-network.zip && \
+    curl -L -O https://github.com/daijro/browserforge/raw/main/browserforge/headers/data/header-network.zip && \
+    curl -L -O https://github.com/daijro/browserforge/raw/main/browserforge/headers/data/browser-helper-file.json && \
+    curl -L -O https://github.com/daijro/browserforge/raw/main/browserforge/headers/data/headers-order.json && \
+    cd /usr/local/lib/python3.11/site-packages/browserforge/fingerprints/data && \
+    curl -L -O https://github.com/daijro/browserforge/raw/main/browserforge/fingerprints/data/fingerprint-network.zip && \
+    apt-get remove -y curl && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN useradd --create-home --shell /bin/bash suno-user \
     && mkdir -p /home/suno-user/.cache \
     && cp -a /opt/camoufox /home/suno-user/.cache/camoufox \
@@ -130,7 +151,9 @@ USER suno-user
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-  CMD python -c "import http.client, sys; conn=http.client.HTTPConnection('127.0.0.1', 8000, timeout=5); conn.request('GET', '/'); status = conn.getresponse().status; sys.exit(0 if 200 <= status < 500 else 1)" || exit 1
+ENV BACKEND_HEALTH_TIMEOUT=5
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+  CMD python -c "import http.client, os, sys; timeout=float(os.getenv('BACKEND_HEALTH_TIMEOUT','5')); conn=http.client.HTTPConnection('127.0.0.1', 8000, timeout=timeout); conn.request('GET', '/health'); status = conn.getresponse().status; sys.exit(0 if 200 <= status < 500 else 1)"
+
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

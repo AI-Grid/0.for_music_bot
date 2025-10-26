@@ -829,54 +829,57 @@ CAMOUFOX_SOURCE=auto
     
     # Backend .env
     $backendEnvPath = Join-Path $ProjectRoot "backend\.env"
-    $backendEnvExample = Join-Path $ProjectRoot "backend\.env.example"
     if (-not (Test-Path $backendEnvPath)) {
         Write-Log "Creating backend .env file at '$backendEnvPath'..." "INFO"
-        if (Test-Path $backendEnvExample) {
-            Copy-Item $backendEnvExample $backendEnvPath
-            Write-Log "Backend .env file created from example." "SUCCESS"
-        } else {
-            @"
-SUPABASE_URL=your-supabase-url
-SUPABASE_KEY=your-supabase-key
-VITE_SUPABASE_URL=https://your-project.supabase.co
-VITE_SUPABASE_KEY=your-vite-supabase-key
-USER=your-database-user
-PASSWORD=your-database-password
-HOST=your-database-host
+        @"
+SUPABASE_URL=https://qptddifkwfdyuhqhujul.supabase.co
+SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwdGRkaWZrd2ZkeXVocWh1anVsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDczNDUxNzIsImV4cCI6MjA2MjkyMTE3Mn0.roePCKt1WCX1bpDmOGMSL2XPTQGLO_9Kp9hfbbgP5ds
+VITE_SUPABASE_URL=https://qptddifkwfdyuhqhujul.supabase.co
+VITE_SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwdGRkaWZrd2ZkeXVocWh1anVsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDczNDUxNzIsImV4cCI6MjA2MjkyMTE3Mn0.roePCKt1WCX1bpDmOGMSL2XPTQGLO_9Kp9hfbbgP5ds
+
+# Supabase database connection details
+USER=postgres.qptddifkwfdyuhqhujul
+PASSWORD=PcXI4D0S4PMAEyKd
+HOST=aws-0-ap-southeast-1.pooler.supabase.com
 PORT=5432
 DBNAME=postgres
-GOOGLE_AI_API_KEY=your-google-ai-api-key
+
+GOOGLE_AI_API_KEY=AIzaSyCY4b4mhpy-1fXkt4NF224JWsiPJio6b5Q
 "@ | Out-File -FilePath $backendEnvPath -Encoding ascii
-            Write-Log "Backend .env file created with defaults." "SUCCESS"
-        }
+        Write-Log "Backend .env file created with hardcoded values." "SUCCESS"
     } else {
         Write-Log "Backend .env file already exists at '$backendEnvPath'. Skipping creation." "INFO"
     }
     
     # Frontend .env
     $frontendEnvPath = Join-Path $ProjectRoot "frontend\.env"
-    $frontendEnvExample = Join-Path $ProjectRoot "frontend\.env.example"
     if (-not (Test-Path $frontendEnvPath)) {
         Write-Log "Creating frontend .env file at '$frontendEnvPath'..." "INFO"
-        if (Test-Path $frontendEnvExample) {
-            Copy-Item $frontendEnvExample $frontendEnvPath
-            Write-Log "Frontend .env file created from example." "SUCCESS"
-        } else {
-            @"
-VITE_SUPABASE_URL=your_supabase_url_here
-VITE_SUPABASE_KEY=your_supabase_key_here
+        @"
+SUPABASE_URL=https://qptddifkwfdyuhqhujul.supabase.co
+SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwdGRkaWZrd2ZkeXVocWh1anVsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDczNDUxNzIsImV4cCI6MjA2MjkyMTE3Mn0.roePCKt1WCX1bpDmOGMSL2XPTQGLO_9Kp9hfbbgP5ds
+VITE_SUPABASE_URL=https://qptddifkwfdyuhqhujul.supabase.co
+VITE_SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFwdGRkaWZrd2ZkeXVocWh1anVsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDczNDUxNzIsImV4cCI6MjA2MjkyMTE3Mn0.roePCKt1WCX1bpDmOGMSL2XPTQGLO_9Kp9hfbbgP5ds
+
+# Supabase database connection details
+USER=postgres.qptddifkwfdyuhqhujul
+PASSWORD=PcXI4D0S4PMAEyKd
+HOST=aws-0-ap-southeast-1.pooler.supabase.com
+PORT=5432
+DBNAME=postgres
+
+GOOGLE_AI_API_KEY=AIzaSyCY4b4mhpy-1fXkt4NF224JWsiPJio6b5Q
+
+# API Configuration for local development
+# This value is automatically synced with .env.dev at project root
 VITE_API_URL=http://localhost:8000
-NODE_ENV=production
 "@ | Out-File -FilePath $frontendEnvPath -Encoding ascii
-            Write-Log "Frontend .env file created with defaults." "SUCCESS"
-        }
+        Write-Log "Frontend .env file created with hardcoded values." "SUCCESS"
     } else {
         Write-Log "Frontend .env file already exists at '$frontendEnvPath'. Skipping creation." "INFO"
     }
     
-    Write-Log "Environment files have been created with default values." "INFO"
-    Write-Log "IMPORTANT: Please edit the .env files to add your actual credentials and API keys." "IMPORTANT"
+    Write-Log "Environment files have been created with hardcoded values." "SUCCESS"
 }
 
 function Display-FinalStatus {
@@ -887,11 +890,8 @@ function Display-FinalStatus {
         Write-Log -Level SUCCESS -Message "All components have been installed and configured successfully!"
         Write-Host "`nYour Suno Automation environment is ready to use."
         Write-Host "`nNext steps:"
-        Write-Host "1. Edit the .env files to add your credentials:"
-        Write-Host "   - backend\.env: Add your Supabase and Google AI API keys"
-        Write-Host "   - frontend\.env: Add your Supabase URL and keys"
-        Write-Host "2. Run 'scripts\windows\start.bat' to launch the application"
-        Write-Host "3. Run 'scripts\windows\stop.bat' to stop the application"
+        Write-Host "1. Run 'scripts\windows\start.bat' to launch the application"
+        Write-Host "2. Run 'scripts\windows\stop.bat' to stop the application"
         Write-Host ""
         
         if (-not $NonInteractive) {

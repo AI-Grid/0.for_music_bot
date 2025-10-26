@@ -1,137 +1,126 @@
 <#
-System: Suno Automation
-Module: Windows Setup Automation
-File URL: scripts/windows/setup-windows.ps1
-Purpose: One-click Windows bootstrap script that provisions all project prerequisites
 .SYNOPSIS
-    Portable PowerShell script to set up Suno Automation development environment
+    Portable PowerShell script to set up Suno Automation development environment.
 .DESCRIPTION
-    This script installs Git, Node.js (>=24.10), and Python 3.14 if needed,
-    then sets up the Suno Automation project with proper logging and error handling.
-    Uses $PSScriptRoot for portability and supports -NoPrompt for CI/CD.
-.PARAMETER NoPrompt
-    Skip interactive prompts for automated/CI execution
+    This script provides a robust, portable, and idempotent solution for setting up
+    'suno-automation' project. It performs the following actions:
+    1.  Sets up a dual-channel logging framework (File and Windows Event Viewer).
+    2.  Validates prerequisites (Git, Node.js, Python) against minimum versions.
+    3.  Automatically installs or upgrades missing/outdated prerequisites using winget.
+    4.  Clones 'suno-automation' repository from GitHub.
+    5.  Creates a Python virtual environment and installs dependencies without requiring activation.
+    6.  Installs frontend dependencies using npm.
+    7.  Supports a -NonInteractive switch for CI/CD environments.
+.PARAMETER NonInteractive
+    If specified, script will not prompt for user input at the end of execution.
 .EXAMPLE
-    .\setup-windows.ps1
+   .\setup-windows.ps1
 .EXAMPLE
-    .\setup-windows.ps1 -NoPrompt
+   .\setup-windows.ps1 -NonInteractive
 #>
 
-[CmdletBinding()]
 param(
-    [switch]$NoPrompt
+    [switch]$NonInteractive
 )
 
-# Error handling preference
-$ErrorActionPreference = 'Stop'
+# --- Script Configuration ---
+$RepoUrl = "https://github.com/vnmw7/suno-automation.git"
+$RepoName = "suno-automation"
+$MinNodeVersion = [version]'24.10.0'
+$MinPythonVersion = [version]'3.14.0'
+$EventSource = "Suno Automation Setup"
 
-# Initialize global variables
-$script:blnSuccess = $true
-$script:blnNeedsInstall = $false
-$script:strInstallReport = ""
+# --- Path and Logging Initialization ---
+# Use $PSScriptRoot for reliable, portable pathing.
+$ScriptRoot = $PSScriptRoot
+$ProjectRoot = Join-Path $ScriptRoot $RepoName
+$LogDir = Join-Path $ScriptRoot "logs"
 
-# Core configuration
-$script:RepoUrl = "https://github.com/vnmw7/suno-automation.git"
-$script:RepoName = "suno-automation"
-$script:MinNodeVersion = [version]'24.10.0'
-$script:MinPythonVersion = [version]'3.14.0'
-
-# Path resolution with fallback
-$script:scriptRoot = $PSScriptRoot
-if (-not $script:scriptRoot) { 
-    $script:scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path 
+# Set up logging immediately.
+try {
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction Stop | Out-Null
+    }
+    $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $LogFile = Join-Path $LogDir "setup-windows-$($Timestamp).log"
+    "Script started at $(Get-Date)" | Out-File -FilePath $LogFile -Encoding UTF8 -ErrorAction Stop
+} catch {
+    Write-Host " CRITICAL: Failed to initialize file logging at '$LogDir'. Please check permissions. Aborting." -ForegroundColor Red
+    exit 1
 }
-$script:ProjectRoot = Join-Path $script:scriptRoot $script:RepoName
 
-# Logging setup
-$script:logDir = Join-Path $script:scriptRoot "logs"
-if (-not (Test-Path $script:logDir)) { 
-    New-Item -ItemType Directory -Path $script:logDir -Force | Out-Null 
-}
-$script:timeStamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
-$script:logFile = Join-Path $script:logDir "setup-windows-$($script:timeStamp).log"
-$script:eventSource = "Suno Automation Setup"
+# --- Core Functions ---
 
-# Write-Log function - centralized logging
 function Write-Log {
     param(
-        [Parameter(Mandatory=$true)]
-        [string]$Message,
-        
-        [Parameter(Mandatory=$true)]
-        [ValidateSet("INFO", "WARNING", "ERROR", "SUCCESS", "DEBUG", "IMPORTANT")]
-        [string]$Level
+        [Parameter(Mandatory)][string]$Message,
+        [Parameter(Mandatory)][string]$Level
     )
-    
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logEntry = "[$timestamp] [$Level] $Message"
-    
-    # Console output with colors
-    $color = switch ($Level) {
-        "INFO" { "White" }
-        "WARNING" { "Yellow" }
-        "ERROR" { "Red" }
-        "SUCCESS" { "Green" }
-        "DEBUG" { "Magenta" }
-        "IMPORTANT" { "Cyan" }
-        default { "White" }
-    }
-    Write-Host "[$Level] $Message" -ForegroundColor $color
-    
-    # File output
-    Add-Content -Path $script:logFile -Value $logEntry -Encoding UTF8
-    
-    # Event Viewer output with graceful degradation
+    $logEntry = "[$Level] $Message"
+    $color = @{
+        INFO    = "White"
+        WARN    = "Yellow"
+        ERROR   = "Red"
+        SUCCESS = "Green"
+        DEBUG   = "Gray"
+    }[$Level]
+
+    Write-Host $logEntry -ForegroundColor $color
+    Add-Content -Path $LogFile -Value $logEntry
+
+    # Write to Event Viewer, failing gracefully if permissions are insufficient.
     try {
-        $eventType = switch ($Level) {
-            "INFO" { "Information" }
-            "WARNING" { "Warning" }
-            "ERROR" { "Error" }
-            "SUCCESS" { "Information" }
-            "DEBUG" { "Information" }
-            "IMPORTANT" { "Information" }
-            default { "Information" }
+        if (-not [System.Diagnostics.EventLog]::SourceExists($EventSource)) {
+            # This operation requires elevation.
+            New-EventLog -LogName Application -Source $EventSource -ErrorAction Stop
         }
-        
-        # Try PowerShell cmdlet first
-        if (-not [System.Diagnostics.EventLog]::SourceExists($script:eventSource)) {
-            New-EventLog -LogName Application -Source $script:eventSource -ErrorAction SilentlyContinue
-        }
-        
-        if ([System.Diagnostics.EventLog]::SourceExists($script:eventSource)) {
-            Write-EventLog -LogName Application -Source $script:eventSource -EventId 1 -EntryType $eventType -Message $Message -ErrorAction SilentlyContinue
-        } else {
-            # Fallback to eventcreate
-            & eventcreate /ID 1 /L Application /T $eventType /SO "$script:eventSource" /D "$Message" 2>$null
-        }
+        $eventType = @{
+            ERROR = "Error"
+            WARN  = "Warning"
+        }.GetEnumerator() | Where-Object { $_.Key -eq $Level } | ForEach-Object { $_.Value }
+        if (-not $eventType) { $eventType = "Information" }
+
+        Write-EventLog -LogName Application -Source $EventSource -EventId 1 -EntryType $eventType -Message $Message -ErrorAction SilentlyContinue
     } catch {
-        # Silently continue if Event Viewer logging fails
+        # Non-critical failure, log to file and continue.
+        $eventViewerError = " Could not write to Windows Event Viewer. Error: $($_.Exception.Message)"
+        Add-Content -Path $LogFile -Value $eventViewerError
     }
 }
 
-# Execute-Command function - unified command execution
-function Execute-Command {
+function Run-Exe {
     param(
-        [Parameter(Mandatory=$true)]
-        [string]$Command,
-        
-        [Parameter(Mandatory=$true)]
-        [string]$SuccessMessage,
-        
-        [Parameter(Mandatory=$true)]
-        [string]$FailureMessage,
-        
+        [Parameter(Mandatory=$true)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [string]$SuccessMessage = "",
+        [string]$FailureMessage = "",
         [switch]$ContinueOnError
     )
-    
-    Write-Log "Executing: $Command" "DEBUG"
+    Write-Log "Executing: $FilePath $($ArgumentList -join ' ')" "DEBUG"
     try {
-        $output = Invoke-Expression $Command 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Log $SuccessMessage "SUCCESS"
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $FilePath
+        $psi.RedirectStandardError = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        foreach ($arg in $ArgumentList) { [void]$psi.ArgumentList.Add($arg) }
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $psi
+        $null = $p.Start()
+        $stdout = $p.StandardOutput.ReadToEnd()
+        $stderr = $p.StandardError.ReadToEnd()
+        $p.WaitForExit()
+        $code = $p.ExitCode
+        if ($code -eq 0) {
+            if ($SuccessMessage) { Write-Log $SuccessMessage "SUCCESS" }
+            if ($stdout.Trim()) { Write-Log "Out: $($stdout.Trim())" "DEBUG" }
+            if ($stderr.Trim()) { Write-Log "Err: $($stderr.Trim())" "DEBUG" }
             return $true
         } else {
-            Write-Log "$FailureMessage (Exit Code: $LASTEXITCODE)" "ERROR"
+            Write-Log "$FailureMessage (Exit Code: $code)" "ERROR"
+            if ($stdout.Trim()) { Write-Log "Out: $($stdout.Trim())" "ERROR" }
+            if ($stderr.Trim()) { Write-Log "Err: $($stderr.Trim())" "ERROR" }
             if (-not $ContinueOnError) {
                 $script:blnSuccess = $false
                 $script:strInstallReport += "$FailureMessage`n"
@@ -148,84 +137,67 @@ function Execute-Command {
     }
 }
 
-# Get-CommandVersion function - robust version parsing
 function Get-CommandVersion {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$Command,
-        
-        [Parameter(Mandatory=$true)]
-        [string]$VersionArgument
-    )
-    
+    param([string]$Command, [string]$VersionArgument)
     try {
         $output = & $Command $VersionArgument 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0) {
-            return $null
-        }
-        
-        # Extract version using regex
         if ($output -match '(\d+\.\d+\.\d+)') {
             return [version]$matches[1]
-        } elseif ($output -match 'v(\d+\.\d+\.\d+)') {
-            return [version]$matches[1]
-        } elseif ($output -match '(\d+\.\d+)') {
-            return [version]$matches[1]
-        } else {
-            return $null
         }
+        return $null
     } catch {
         return $null
     }
 }
 
-# Ensure-Admin function - check admin privileges
-function Ensure-Admin {
-    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Log "This script requires administrator privileges for installing software." "ERROR"
-        Write-Log "Please right-click this script and select 'Run as administrator.'" "INFO"
-        if (-not $NoPrompt) {
-            Write-Host "Press Enter to exit..."
-            Read-Host
-        }
-        exit 1
+function Get-WingetPackage {
+    param([Parameter(Mandatory=$true)][string]$Id)
+    $args = @("list", "-e", "--id", $Id)
+    Write-Log "winget $($args -join ' ')" "DEBUG"
+    $psi = (Run-Exe -FilePath "winget" -ArgumentList $args -SuccessMessage "" -FailureMessage "winget list failed" -ContinueOnError)
+    if (-not $psi) {
+        return $null
     }
+    # Re-run to capture output
+    $p = Start-Process -FilePath "winget" -ArgumentList $args -NoNewWindow -PassThru -Wait -RedirectStandardOutput ([IO.Path]::GetTempFileName()) -RedirectStandardError ([IO.Path]::GetTempFileName())
+    $out = Get-Content $p.StandardOutput -Raw
+    if ($p.ExitCode -ne 0 -or -not $out) { return $null }
+    # Heuristic: any non-header line indicates presence
+    if ($out -match "^\s*\S+" -and $out -match "Version") { return $out }
+    return $null
 }
 
-# Test-Network function - check connectivity
-function Test-Network {
-    Write-Log "Checking network connectivity..." "INFO"
-    try {
-        $result = Test-Connection -ComputerName "google.com" -Count 1 -Quiet
-        if ($result) {
-            Write-Log "Network connectivity confirmed." "SUCCESS"
-            return $true
-        } else {
-            Write-Log "No internet connection detected. Please check your network and try again." "ERROR"
+function InstallOrUpgrade-Package {
+    param(
+        [Parameter(Mandatory=$true)][string]$Id,
+        [string]$FriendlyName = $Id
+    )
+    $present = Get-WingetPackage -Id $Id
+    if (-not $present) {
+        Write-Log "$FriendlyName not tracked by winget. Installing..." "INFO"
+        if (-not (Run-Exe -FilePath "winget" -ArgumentList @("install","-e","--id",$Id,"--accept-package-agreements","--accept-source-agreements") -SuccessMessage "$FriendlyName installed." -FailureMessage "Failed to install $FriendlyName.")) {
             return $false
         }
-    } catch {
-        Write-Log "Network check failed: $($_.Exception.Message)" "ERROR"
-        return $false
-    }
-}
-
-# Test-Winget function - check winget availability
-function Test-Winget {
-    Write-Log "Checking for Winget..." "INFO"
-    try {
-        $null = Get-Command "winget" -ErrorAction Stop
-        Write-Log "Winget is available." "SUCCESS"
         return $true
-    } catch {
-        Write-Log "Winget is not available on this system." "ERROR"
-        Write-Log "Please install Windows Package Manager or update your Windows 10/11 installation." "INFO"
-        return $false
+    } else {
+        Write-Log "$FriendlyName tracked by winget. Upgrading if needed..." "INFO"
+        # First try a normal upgrade
+        $ok = Run-Exe -FilePath "winget" -ArgumentList @("upgrade","-e","--id",$Id,"--accept-package-agreements","--accept-source-agreements") -SuccessMessage "$FriendlyName upgraded (or already up-to-date)." -FailureMessage "Failed to upgrade $FriendlyName." -ContinueOnError
+        if (-not $ok) {
+            # Retry with include-unknown (for MSI installs winget doesn't map)
+            Write-Log "Retrying $FriendlyName upgrade with --include-unknown..." "WARNING"
+            $ok2 = Run-Exe -FilePath "winget" -ArgumentList @("upgrade","-e","--id",$Id,"--include-unknown","--accept-package-agreements","--accept-source-agreements") -SuccessMessage "$FriendlyName upgraded (include-unknown)." -FailureMessage "Failed to upgrade $FriendlyName (include-unknown)." -ContinueOnError
+            if (-not $ok2) {
+                # Final fallback: install (winget may treat this as "install or upgrade")
+                Write-Log "Falling back to install for $FriendlyName..." "WARNING"
+                $ok3 = Run-Exe -FilePath "winget" -ArgumentList @("install","-e","--id",$Id,"--accept-package-agreements","--accept-source-agreements") -SuccessMessage "$FriendlyName installed via fallback." -FailureMessage "Failed to install $FriendlyName (fallback)."
+                return $ok3
+            }
+        }
+        return $true
     }
 }
 
-# Refresh-NodePath function - update PATH for Node.js
 function Refresh-NodePath {
     $nodeLocations = @(
         "$env:ProgramFiles\nodejs\node.exe",
@@ -243,7 +215,6 @@ function Refresh-NodePath {
     }
 }
 
-# Refresh-PythonPath function - update PATH for Python
 function Refresh-PythonPath {
     $pyLocations = @(
         "$env:LocalAppData\Programs\Python\Python314\python.exe",
@@ -261,159 +232,150 @@ function Refresh-PythonPath {
     }
 }
 
-# Main execution starts here
-Write-Log "Suno Automation - Windows Setup Script started." "INFO"
-Write-Log "Log file: $script:logFile" "INFO"
-Write-Log "Script root: $script:scriptRoot" "DEBUG"
-Write-Log "Project root: $script:ProjectRoot" "DEBUG"
-
-# Display header
-Write-Host ""
-Write-Host "========================================"
-Write-Host " Suno Automation - Windows Setup Script"
-Write-Host "========================================"
-Write-Host ""
-Write-Host "This script will install Git, Node.js, and Python 3.14,"
-Write-Host "then set up Suno Automation project environment."
-Write-Host ""
-
-# Prerequisite checks
-if (-not (Ensure-Admin)) { exit 1 }
-if (-not (Test-Network)) { 
-    if (-not $NoPrompt) {
-        Write-Host "Press Enter to exit..."
-        Read-Host
+function Resolve-Python314 {
+    # Prefer py launcher
+    $py = Get-Command "py" -ErrorAction SilentlyContinue
+    if ($py) {
+        try {
+            $exe = & py -3.14 -c "import sys; print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path $exe)) { return $exe.Trim() }
+        } catch {}
     }
-    exit 1 
-}
-if (-not (Test-Winget)) { 
-    if (-not $NoPrompt) {
-        Write-Host "Press Enter to exit..."
-        Read-Host
-    }
-    exit 1 
+    # Fallback: probe common install paths
+    $candidates = @(
+        "$env:LocalAppData\Programs\Python\Python314\python.exe",
+        "$env:ProgramFiles\Python314\python.exe",
+        "$env:ProgramFiles\Python\Python314\python.exe"
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+    return $null
 }
 
-# Continue with tool installation and setup...
-Write-Log "Prerequisites validated. Proceeding with setup..." "SUCCESS"
-
-# --- Tool Installation Functions ---
-
-function Install-Git {
-    Write-Log "Checking Git installation..." "INFO"
-    $gitVersion = Get-CommandVersion "git" "--version"
-    
-    if (-not $gitVersion) {
-        Write-Log "Installing Git via Winget..." "INFO"
-        if (Execute-Command "winget install --exact --accept-package-agreements --accept-source-agreements Git.Git" `
-                     "Git installed successfully." "Failed to install Git.") {
-            $script:blnNeedsInstall = $true
-        }
-    } else {
-        Write-Log "Git is already installed ($gitVersion)." "SUCCESS"
-    }
-}
+# --- Prerequisite Installation Functions ---
 
 function Install-NodeJS {
     Write-Log "Checking Node.js installation..." "INFO"
+    $nodeVersion = Get-CommandVersion "node" "-v"  # handles vX.Y.Z
+    if ($nodeVersion -and $nodeVersion -ge $MinNodeVersion) {
+        Write-Log "Node.js is available ($nodeVersion)." "SUCCESS"
+        return
+    }
+
+    if (-not (InstallOrUpgrade-Package -Id "OpenJS.NodeJS.LTS" -FriendlyName "Node.js LTS")) {
+        $script:blnSuccess = $false
+        $script:strInstallReport += "Failed to install/upgrade Node.js`n"
+        return
+    }
+
+    Refresh-NodePath
     $nodeVersion = Get-CommandVersion "node" "-v"
-    
-    if (-not $nodeVersion) {
-        Write-Log "Node.js not found. Installing Node.js LTS via Winget..." "INFO"
-        if (Execute-Command "winget install --exact --accept-package-agreements --accept-source-agreements OpenJS.NodeJS.LTS" `
-                     "Node.js installed successfully." "Failed to install Node.js.") {
-            $script:blnNeedsInstall = $true
-            Refresh-NodePath
-        }
-    } elseif ($nodeVersion -lt $script:MinNodeVersion) {
-        Write-Log "Node.js version $nodeVersion does not meet the required $script:MinNodeVersion. Upgrading..." "INFO"
-        if (Execute-Command "winget upgrade --exact --accept-package-agreements --accept-source-agreements OpenJS.NodeJS.LTS" `
-                     "Node.js upgraded to latest LTS." "Failed to upgrade Node.js.") {
-            $script:blnNeedsInstall = $true
-            Refresh-NodePath
-        }
+    if (-not $nodeVersion -or $nodeVersion -lt $MinNodeVersion) {
+        Write-Log "Node.js is not available at required version after install/upgrade." "ERROR"
+        $script:blnSuccess = $false
+        $script:strInstallReport += "Node.js unavailable or below minimum in current session`n"
     } else {
         Write-Log "Node.js is available ($nodeVersion)." "SUCCESS"
-    }
-    
-    # Verify Node.js availability
-    $nodeVersion = Get-CommandVersion "node" "-v"
-    if (-not $nodeVersion) {
-        Write-Log "Node.js is not available in this session after installation." "ERROR"
-        $script:blnSuccess = $false
-        $script:strInstallReport += "Node.js unavailable in current session`n"
     }
 }
 
 function Install-Python {
     Write-Log "Checking Python 3.14 installation..." "INFO"
     $pythonVersion = Get-CommandVersion "python" "--version"
-    
-    if (-not $pythonVersion) {
-        Write-Log "Python 3.14 not found. Installing via Winget..." "INFO"
-        if (Execute-Command "winget install --exact --accept-package-agreements --accept-source-agreements Python.Python.3.14" `
-                     "Python 3.14 installed successfully." "Failed to install Python 3.14.") {
-            $script:blnNeedsInstall = $true
-            Refresh-PythonPath
-        }
-    } elseif ($pythonVersion -lt $script:MinPythonVersion) {
-        Write-Log "Python version $pythonVersion does not meet the required $script:MinPythonVersion. Upgrading..." "INFO"
-        if (Execute-Command "winget upgrade --exact --accept-package-agreements --accept-source-agreements Python.Python.3.14" `
-                     "Python upgraded to 3.14." "Failed to upgrade Python.") {
-            $script:blnNeedsInstall = $true
-            Refresh-PythonPath
-        }
-    } else {
-        Write-Log "Python is available ($pythonVersion)." "SUCCESS"
-    }
-    
-    # Verify Python availability
-    $pythonVersion = Get-CommandVersion "python" "--version"
-    if (-not $pythonVersion) {
-        Write-Log "Python is not available in this session after installation." "ERROR"
+
+    # Ensure winget has Python 3.14 installed (side-by-side is OK)
+    $ok = InstallOrUpgrade-Package -Id "Python.Python.3.14" -FriendlyName "Python 3.14"
+    if (-not $ok) {
         $script:blnSuccess = $false
-        $script:strInstallReport += "Python unavailable in current session`n"
+        $script:strInstallReport += "Failed to install/upgrade Python 3.14`n"
+        return
+    }
+    Refresh-PythonPath
+
+    $exe314 = Resolve-Python314
+    if (-not $exe314) {
+        Write-Log "Python 3.14 executable not found after installation." "ERROR"
+        $script:blnSuccess = $false
+        $script:strInstallReport += "Python 3.14 unavailable in current session`n"
+        return
+    }
+    Write-Log "Python 3.14 resolved at: $exe314" "SUCCESS"
+}
+
+function Install-Git {
+    Write-Log "Checking Git installation..." "INFO"
+    $gitVersion = Get-CommandVersion "git" "--version"
+    if ($gitVersion) {
+        Write-Log "Git is already installed ($gitVersion)." "SUCCESS"
+    } else {
+        Write-Log "Installing Git via Winget..." "INFO"
+        if (-not (InstallOrUpgrade-Package -Id "Git.Git" -FriendlyName "Git")) {
+            $script:blnSuccess = $false
+            $script:strInstallReport += "Failed to install Git`n"
+        }
     }
 }
 
-# --- Repository Management ---
+# --- Network and Other Checks ---
+
+function Test-Network {
+    Write-Log "Checking network connectivity..." "INFO"
+    try {
+        $resp = Invoke-WebRequest -UseBasicParsing -Method Head "https://github.com" -TimeoutSec 10
+        if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 500) {
+            Write-Log "Network connectivity confirmed." "SUCCESS"
+            return $true
+        }
+        Write-Log "Network check returned HTTP $($resp.StatusCode)." "ERROR"
+        return $false
+    } catch {
+        Write-Log "Network check failed: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
+
+function Ensure-Admin {
+    try {
+        $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            Write-Log "This script requires administrator privileges for installing software." "ERROR"
+            Write-Log "Please right-click this script and select 'Run as administrator.'" "INFO"
+            return $false
+        }
+        Write-Log "Running with administrator privileges." "SUCCESS"
+        return $true
+    } catch {
+        Write-Log "Failed to check administrator privileges: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
+
+# --- Repository and Environment Setup ---
 
 function Setup-Repository {
-    Write-Log "Setting up repository at $script:ProjectRoot..." "INFO"
+    Write-Log "Setting up repository at $ProjectRoot..." "INFO"
     
-    if (Test-Path "$script:ProjectRoot\.git") {
+    if (Test-Path (Join-Path $ProjectRoot ".git")) {
         Write-Log "Existing repository found. Updating..." "INFO"
-        Push-Location $script:ProjectRoot
-        $result = Execute-Command "git pull" "Repository updated successfully." "Failed to pull updates." -ContinueOnError
-        Pop-Location
-    } elseif (Test-Path $script:ProjectRoot) {
-        Write-Log "Project directory '$script:ProjectRoot' already exists and is not a git repository." "ERROR"
+        if (-not (Run-Exe -FilePath "git" -ArgumentList @("-C","`"$ProjectRoot`"","pull") -SuccessMessage "Repository updated successfully." -FailureMessage "Failed to pull updates." -ContinueOnError)) {
+            $script:blnSuccess = $false
+            $script:strInstallReport += "Failed to pull updates`n"
+        }
+    } elseif (Test-Path $ProjectRoot) {
+        Write-Log "Project directory '$ProjectRoot' already exists and is not a git repository." "ERROR"
         $script:blnSuccess = $false
         $script:strInstallReport += "Failed to clone repository - directory exists without .git`n"
     } else {
         Write-Log "No existing repository found. Cloning a fresh copy..." "INFO"
-        if (Execute-Command "git clone `"$script:RepoUrl`" `"$script:ProjectRoot`"" `
-                     "Repository cloned to $script:ProjectRoot" "Failed to clone repository.") {
-            Write-Log "Repository cloned successfully." "SUCCESS"
+        if (-not (Run-Exe -FilePath "git" -ArgumentList @("clone","`"$RepoUrl`"","`"$ProjectRoot`"") -SuccessMessage "Repository cloned to $ProjectRoot" -FailureMessage "Failed to clone repository.")) {
+            $script:blnSuccess = $false
+            $script:strInstallReport += "Failed to clone repository`n"
         }
     }
 }
 
-# Execute tool installations
-Write-Log "--- Stage 1: Installing Prerequisites ---" "INFO"
-Install-Git
-Install-NodeJS
-Install-Python
-
-# Setup repository
-Write-Log "--- Stage 2: Repository Setup ---" "INFO"
-Setup-Repository
-
-# --- Backend and Frontend Setup ---
-
 function Setup-Backend {
     Write-Log "Setting up backend environment..." "INFO"
-    $backendPath = Join-Path $script:ProjectRoot "backend"
+    $backendPath = Join-Path $ProjectRoot "backend"
     
     if (-not (Test-Path $backendPath)) {
         Write-Log "Backend directory not found at '$backendPath'." "ERROR"
@@ -422,48 +384,58 @@ function Setup-Backend {
         return
     }
     
+    Write-Log "Changing directory to '$backendPath'." "DEBUG"
     Push-Location $backendPath
     
-    # Create virtual environment if not exists
+    # Resolve Python 3.14 path (installed by Install-Python)
+    $exe314 = Resolve-Python314
+    if (-not $exe314) {
+        Write-Log "Python 3.14 could not be resolved. Backend setup aborted." "ERROR"
+        $script:blnSuccess = $false
+        $script:strInstallReport += "Python 3.14 resolver failed`n"
+        Pop-Location
+        return
+    }
+
+    # Create venv with Python 3.14
     if (-not (Test-Path ".venv")) {
-        Write-Log "Creating Python virtual environment..." "INFO"
-        if (-not (Execute-Command "python -m venv .venv" "Virtual environment created." "Failed to create virtual environment.") {
+        Write-Log "Creating Python 3.14 virtual environment..." "INFO"
+        if (-not (Run-Exe -FilePath $exe314 -ArgumentList @("-m","venv",".venv") -SuccessMessage "Virtual environment created." -FailureMessage "Failed to create virtual environment.")) {
             Pop-Location
             return
         }
     } else {
         Write-Log "Virtual environment already exists." "SUCCESS"
     }
-    
-    # Use venv pip directly (no activation needed)
-    $pipPath = ".venv\Scripts\pip.exe"
-    if (-not (Test-Path $pipPath)) {
-        Write-Log "Failed to find pip in virtual environment." "ERROR"
+
+    # Use venv's python -m pip (most robust)
+    $venvPy = Join-Path (Resolve-Path ".\.venv\Scripts").Path "python.exe"
+    if (-not (Test-Path $venvPy)) {
+        Write-Log "venv python.exe not found." "ERROR"
         $script:blnSuccess = $false
         $script:strInstallReport += "Failed to activate virtual environment`n"
         Pop-Location
         return
     }
-    
+
     # Upgrade pip
-    Execute-Command "$pipPath install --upgrade pip" "Pip upgraded." "Failed to upgrade pip." -ContinueOnError
-    
-    # Install Python requirements
+    Run-Exe -FilePath $venvPy -ArgumentList @("-m","pip","install","--upgrade","pip") -SuccessMessage "Pip upgraded." -FailureMessage "Failed to upgrade pip." -ContinueOnError
+
+    # Install requirements
     if (Test-Path "requirements.txt") {
-        if (-not (Execute-Command "$pipPath install -r requirements.txt" "Python dependencies installed." "Failed to install Python dependencies.")) {
+        if (-not (Run-Exe -FilePath $venvPy -ArgumentList @("-m","pip","install","-r","requirements.txt") -SuccessMessage "Python dependencies installed." -FailureMessage "Failed to install Python dependencies.")) {
             Pop-Location
             return
         }
     } else {
         Write-Log "requirements.txt not found in backend directory." "WARNING"
     }
-    
-    # Download Camoufox payload
-    Write-Log "Downloading Camoufox browser payload..." "INFO"
-    $camoufoxCmd = ".venv\Scripts\camoufox.exe"
-    if (-not (Test-Path $camoufoxCmd)) { $camoufoxCmd = ".venv\Scripts\camoufox" }
-    if (Test-Path $camoufoxCmd) {
-        Execute-Command "$camoufoxCmd fetch" "Camoufox payload downloaded." "Failed to download Camoufox payload." -ContinueOnError
+
+    # Camoufox fetch (if present)
+    $camouPath = Join-Path (Split-Path $venvPy -Parent) "camoufox.exe"
+    if (-not (Test-Path $camouPath)) { $camouPath = Join-Path (Split-Path $venvPy -Parent) "camoufox" }
+    if (Test-Path $camouPath) {
+        Run-Exe -FilePath $camouPath -ArgumentList @("fetch") -SuccessMessage "Camoufox payload downloaded." -FailureMessage "Failed to download Camoufox payload." -ContinueOnError
     } else {
         Write-Log "Camoufox tool not found in the virtual environment. Skipping payload download." "WARNING"
     }
@@ -474,7 +446,7 @@ function Setup-Backend {
 
 function Setup-Frontend {
     Write-Log "Setting up frontend dependencies..." "INFO"
-    $frontendPath = Join-Path $script:ProjectRoot "frontend"
+    $frontendPath = Join-Path $ProjectRoot "frontend"
     
     if (-not (Test-Path $frontendPath)) {
         Write-Log "Frontend directory not found at '$frontendPath'." "ERROR"
@@ -483,6 +455,7 @@ function Setup-Frontend {
         return
     }
     
+    Write-Log "Changing directory to '$frontendPath'." "DEBUG"
     Push-Location $frontendPath
     
     # Check npm availability
@@ -495,16 +468,16 @@ function Setup-Frontend {
     }
     
     # Configure npm
-    Execute-Command "npm config set fund false" "npm configured." "Failed to configure npm." -ContinueOnError
+    Run-Exe -FilePath "npm" -ArgumentList @("config","set","fund","false") -SuccessMessage "npm configured." -FailureMessage "Failed to configure npm." -ContinueOnError
     
     # Install dependencies (use ci if lockfile exists)
     if (Test-Path "package-lock.json") {
-        if (-not (Execute-Command "npm ci" "Node.js dependencies installed (ci)." "Failed to install Node.js dependencies.")) {
+        if (-not (Run-Exe -FilePath "npm" -ArgumentList @("ci") -SuccessMessage "Node.js dependencies installed (ci)." -FailureMessage "Failed to install Node.js dependencies.")) {
             Pop-Location
             return
         }
     } else {
-        if (-not (Execute-Command "npm install" "Node.js dependencies installed." "Failed to install Node.js dependencies.")) {
+        if (-not (Run-Exe -FilePath "npm" -ArgumentList @("install") -SuccessMessage "Node.js dependencies installed." -FailureMessage "Failed to install Node.js dependencies.")) {
             Pop-Location
             return
         }
@@ -517,29 +490,31 @@ function Setup-Frontend {
 function Setup-EnvironmentFiles {
     Write-Log "Setting up environment files..." "INFO"
     
-    if (-not (Test-Path $script:ProjectRoot)) {
-        Write-Log "Project root directory '$script:ProjectRoot' not found." "ERROR"
+    if (-not (Test-Path $ProjectRoot)) {
+        Write-Log "Project root directory '$ProjectRoot' not found." "ERROR"
         $script:blnSuccess = $false
         $script:strInstallReport += "Project root directory not found for environment files`n"
         return
     }
     
     # Root .env
-    $rootEnvPath = Join-Path $script:ProjectRoot ".env"
+    $rootEnvPath = Join-Path $ProjectRoot ".env"
     if (-not (Test-Path $rootEnvPath)) {
-        Write-Log "Creating root .env file..." "INFO"
+        Write-Log "Creating root .env file at '$rootEnvPath'..." "INFO"
         @"
 TAG=latest
 CAMOUFOX_SOURCE=auto
 "@ | Out-File -FilePath $rootEnvPath -Encoding ascii
         Write-Log "Root .env file created." "SUCCESS"
+    } else {
+        Write-Log "Root .env file already exists at '$rootEnvPath'. Skipping creation." "INFO"
     }
     
     # Backend .env
-    $backendEnvPath = Join-Path $script:ProjectRoot "backend\.env"
-    $backendEnvExample = Join-Path $script:ProjectRoot "backend\.env.example"
+    $backendEnvPath = Join-Path $ProjectRoot "backend\.env"
+    $backendEnvExample = Join-Path $ProjectRoot "backend\.env.example"
     if (-not (Test-Path $backendEnvPath)) {
-        Write-Log "Creating backend .env file..." "INFO"
+        Write-Log "Creating backend .env file at '$backendEnvPath'..." "INFO"
         if (Test-Path $backendEnvExample) {
             Copy-Item $backendEnvExample $backendEnvPath
             Write-Log "Backend .env file created from example." "SUCCESS"
@@ -558,13 +533,15 @@ GOOGLE_AI_API_KEY=your-google-ai-api-key
 "@ | Out-File -FilePath $backendEnvPath -Encoding ascii
             Write-Log "Backend .env file created with defaults." "SUCCESS"
         }
+    } else {
+        Write-Log "Backend .env file already exists at '$backendEnvPath'. Skipping creation." "INFO"
     }
     
     # Frontend .env
-    $frontendEnvPath = Join-Path $script:ProjectRoot "frontend\.env"
-    $frontendEnvExample = Join-Path $script:ProjectRoot "frontend\.env.example"
+    $frontendEnvPath = Join-Path $ProjectRoot "frontend\.env"
+    $frontendEnvExample = Join-Path $ProjectRoot "frontend\.env.example"
     if (-not (Test-Path $frontendEnvPath)) {
-        Write-Log "Creating frontend .env file..." "INFO"
+        Write-Log "Creating frontend .env file at '$frontendEnvPath'..." "INFO"
         if (Test-Path $frontendEnvExample) {
             Copy-Item $frontendEnvExample $frontendEnvPath
             Write-Log "Frontend .env file created from example." "SUCCESS"
@@ -577,6 +554,8 @@ NODE_ENV=production
 "@ | Out-File -FilePath $frontendEnvPath -Encoding ascii
             Write-Log "Frontend .env file created with defaults." "SUCCESS"
         }
+    } else {
+        Write-Log "Frontend .env file already exists at '$frontendEnvPath'. Skipping creation." "INFO"
     }
     
     Write-Log "Environment files have been created with default values." "INFO"
@@ -584,16 +563,13 @@ NODE_ENV=production
 }
 
 function Display-FinalStatus {
-    Write-Host ""
-    Write-Host "========================================"
+    Write-Host "`n========================================"
     if ($script:blnSuccess) {
-        Write-Host " Setup Complete"
+        Write-Host " Setup Complete" -ForegroundColor Green
         Write-Host "========================================"
-        Write-Host ""
-        Write-Log "All components have been installed and configured successfully!" "SUCCESS"
-        Write-Host "Your Suno Automation environment is ready to use."
-        Write-Host ""
-        Write-Host "Next steps:"
+        Write-Log -Level SUCCESS -Message "All components have been installed and configured successfully!"
+        Write-Host "`nYour Suno Automation environment is ready to use."
+        Write-Host "`nNext steps:"
         Write-Host "1. Edit the .env files to add your credentials:"
         Write-Host "   - backend\.env: Add your Supabase and Google AI API keys"
         Write-Host "   - frontend\.env: Add your Supabase URL and keys"
@@ -601,10 +577,10 @@ function Display-FinalStatus {
         Write-Host "3. Run 'scripts\windows\stop.bat' to stop the application"
         Write-Host ""
         
-        if (-not $NoPrompt) {
-            $startScript = Join-Path $script:ProjectRoot "scripts\windows\start.bat"
+        if (-not $NonInteractive) {
+            $startScript = Join-Path $ProjectRoot "scripts\windows\start.bat"
             if (-not (Test-Path $startScript)) {
-                $startScript = Join-Path $script:scriptRoot "start.bat"
+                $startScript = Join-Path $ScriptRoot "start.bat"
             }
             $response = Read-Host "Would you like to start the application now? (y/n)"
             if ($response -match '^(Y|y)') {
@@ -617,46 +593,90 @@ function Display-FinalStatus {
             }
         }
     } else {
-        Write-Host " Setup Failed"
+        Write-Host " Setup Failed" -ForegroundColor Red
         Write-Host "========================================"
-        Write-Host ""
-        Write-Log "Setup failed. See details below." "ERROR"
-        Write-Host "The following issues were reported:"
-        if ([string]::IsNullOrEmpty($script:strInstallReport)) {
-            Write-Host "- An unexpected error occurred."
-        } else {
-            $script:strInstallReport.Trim() -split "`n" | ForEach-Object { if ($_) { Write-Host $_ } }
-        }
-        Write-Host ""
-        Write-Host "Please check the log file for a complete execution trace:"
-        Write-Host $script:logFile
+        Write-Log -Level ERROR -Message "Setup failed."
+        Write-Host "`nThe following critical issue was reported:"
+        Write-Host "- $script:strInstallReport" -ForegroundColor Yellow
     }
-    
-    Write-Log "Setup script completed. Log file saved to: $script:logFile" "INFO"
-    Write-Host ""
-    Write-Host "Log file saved to: $script:logFile"
-    Write-Host "You can also check the Windows Event Viewer for '$script:eventSource' events."
-    Write-Host ""
-    
-    if (-not $NoPrompt) {
-        Write-Host "Press any key to exit..."
-        $null = [System.Console]::ReadKey($true)
-    }
+    Write-Host "`nPlease check the log file for a complete execution trace:`n$LogFile"
+    Write-Host "You can also check the Windows Event Viewer for '$EventSource' events."
 }
 
-# Execute backend, frontend, and environment setup if repository exists
-if ($script:blnSuccess -and (Test-Path $script:ProjectRoot)) {
-    Write-Log "--- Stage 3: Backend Setup ---" "INFO"
+# --- Main Execution Flow ---
+
+# Initialize global variables for status tracking
+$script:blnSuccess = $true
+$script:strInstallReport = ""
+
+Write-Log -Level INFO -Message "========================================"
+Write-Log -Level INFO -Message "Suno Automation - Windows Setup Script"
+Write-Log -Level INFO -Message "========================================"
+
+# Display header
+Write-Host ""
+Write-Host "========================================"
+Write-Host " Suno Automation - Windows Setup Script"
+Write-Host "========================================"
+Write-Host ""
+Write-Host "This script will install Git, Node.js, and Python 3.14,"
+Write-Host "then set up Suno Automation project environment."
+Write-Host ""
+
+# 1. Prerequisite System Checks
+Write-Log -Level INFO -Message "--- Stage 1: System Prerequisite Checks ---"
+if (-not (Ensure-Admin)) {
+    if (-not $NonInteractive) {
+        Write-Host "Press Enter to exit..."
+        Read-Host
+    }
+    exit 1
+}
+if (-not (Test-Network)) {
+    if (-not $NonInteractive) {
+        Write-Host "Press Enter to exit..."
+        Read-Host
+    }
+    exit 1
+}
+if (-not (Get-Command "winget" -ErrorAction SilentlyContinue)) {
+    Write-Log -Level ERROR -Message "Windows Package Manager (winget) not found. Aborting."
+    if (-not $NonInteractive) {
+        Write-Host "Press Enter to exit..."
+        Read-Host
+    }
+    exit 1
+}
+Write-Log -Level SUCCESS -Message "Winget is available."
+
+# 2. Toolchain Installation
+Write-Log -Level INFO -Message "--- Stage 2: Installing Developer Toolchain ---"
+Install-Git
+Install-NodeJS
+Install-Python
+
+# 3. Repository Setup
+Write-Log -Level INFO -Message "--- Stage 3: Setting up Project Repository ---"
+Setup-Repository
+
+# 4. Backend, Frontend, and Environment Setup (only if repo setup succeeded)
+if ($script:blnSuccess -and (Test-Path $ProjectRoot)) {
+    Write-Log -Level INFO -Message "--- Stage 4: Configuring Backend Environment ---"
     Setup-Backend
     
-    Write-Log "--- Stage 4: Frontend Setup ---" "INFO"
+    Write-Log -Level INFO -Message "--- Stage 5: Configuring Frontend Environment ---"
     Setup-Frontend
     
-    Write-Log "--- Stage 5: Environment Files ---" "INFO"
+    Write-Log -Level INFO -Message "--- Stage 6: Setting up Environment Files ---"
     Setup-EnvironmentFiles
 }
 
-# Display final status
+# 7. Finalization
 Display-FinalStatus
+
+if (-not $NonInteractive) {
+    Write-Host "`nPress any key to exit..."
+    $null = [System.Console]::ReadKey($true)
+}
 
 exit $(if ($script:blnSuccess) { 0 } else { 1 })

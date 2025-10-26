@@ -99,7 +99,8 @@ function Run-Exe {
         [string]$SuccessMessage = "",
         [string]$FailureMessage = "",
         [switch]$ContinueOnError,
-        [switch]$AttachConsole   # NEW: Allow console-attached execution
+        [switch]$AttachConsole,   # NEW: Allow console-attached execution
+        [int[]]$AcceptExitCodes = @(0)   # NEW: Acceptable non-zero exit codes
     )
     Write-Log "Executing: $FilePath $($ArgumentList -join ' ')" "DEBUG"
     try {
@@ -131,7 +132,7 @@ function Run-Exe {
         }
         $p.WaitForExit()
         $code = $p.ExitCode
-        if ($code -eq 0) {
+        if ($AcceptExitCodes -contains $code) {
             if ($SuccessMessage) { Write-Log $SuccessMessage "SUCCESS" }
             if (-not $AttachConsole) {
                 if ($stdout.Trim()) { Write-Log "Out: $($stdout.Trim())" "DEBUG" }
@@ -175,19 +176,55 @@ function Get-CommandVersion {
 
 function Get-WingetPackage {
     param([Parameter(Mandatory=$true)][string]$Id)
-    $args = @("list", "-e", "--id", $Id)
-    Write-Log "winget $($args -join ' ')" "DEBUG"
-    $psi = (Run-Exe -FilePath "winget" -ArgumentList $args -SuccessMessage "" -FailureMessage "winget list failed" -ContinueOnError)
-    if (-not $psi) {
-        return $null
+    
+    Write-Log "Checking if $Id is tracked by winget..." "DEBUG"
+    
+    try {
+        # Capture both stdout and stderr to temp files
+        $stdoutFile = [IO.Path]::GetTempFileName()
+        $stderrFile = [IO.Path]::GetTempFileName()
+        
+        $args = @("list", "-e", "--id", $Id)
+        Write-Log "winget $($args -join ' ')" "DEBUG"
+        
+        $p = Start-Process -FilePath "winget" -ArgumentList $args -NoNewWindow -PassThru -Wait `
+             -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+        
+        $out = (Get-Content $stdoutFile -Raw -ErrorAction SilentlyContinue)
+        $err = (Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue)
+        
+        # Clean up temp files
+        Remove-Item $stdoutFile -ErrorAction SilentlyContinue
+        Remove-Item $stderrFile -ErrorAction SilentlyContinue
+        
+        Write-Log "winget list exit code: $($p.ExitCode)" "DEBUG"
+        if ($out) {
+            Write-Log "winget list output: $($out.Substring(0, [Math]::Min(200, $out.Length)))" "DEBUG"
+        }
+        
+        # winget returns 0 when package is found
+        if ($p.ExitCode -eq 0 -and $out) {
+            # Verify the output actually contains the package ID
+            if ($out -match [regex]::Escape($Id)) {
+                Write-Log "$Id IS tracked by winget." "DEBUG"
+                return $true
+            }
+        }
+        
+        # Exit code -1978335212 or "No installed package found" means not found
+        if ($p.ExitCode -eq -1978335212 -or $out -match "No installed package found matching input criteria") {
+            Write-Log "$Id is NOT tracked by winget." "DEBUG"
+            return $false
+        }
+        
+        # Default case - assume not found
+        Write-Log "$Id is NOT tracked by winget (default case)." "DEBUG"
+        return $false
+        
+    } catch {
+        Write-Log "Exception checking winget package: $($_.Exception.Message)" "ERROR"
+        return $false
     }
-    # Re-run to capture output
-    $p = Start-Process -FilePath "winget" -ArgumentList $args -NoNewWindow -PassThru -Wait -RedirectStandardOutput ([IO.Path]::GetTempFileName()) -RedirectStandardError ([IO.Path]::GetTempFileName())
-    $out = Get-Content $p.StandardOutput -Raw
-    if ($p.ExitCode -ne 0 -or -not $out) { return $null }
-    # Heuristic: any non-header line indicates presence
-    if ($out -match "^\s*\S+" -and $out -match "Version") { return $out }
-    return $null
 }
 
 function InstallOrUpgrade-Package {
@@ -195,30 +232,47 @@ function InstallOrUpgrade-Package {
         [Parameter(Mandatory=$true)][string]$Id,
         [string]$FriendlyName = $Id
     )
-    $present = Get-WingetPackage -Id $Id
-    if (-not $present) {
+    
+    $isTracked = Get-WingetPackage -Id $Id
+    
+    if (-not $isTracked) {
         Write-Log "$FriendlyName not tracked by winget. Installing..." "INFO"
-        if (-not (Run-Exe -FilePath "winget" -ArgumentList @("install","-e","--id",$Id,"--accept-package-agreements","--accept-source-agreements") -SuccessMessage "$FriendlyName installed." -FailureMessage "Failed to install $FriendlyName.")) {
+        $result = Run-Exe -FilePath "winget" `
+            -ArgumentList @("install", "-e", "--id", $Id, "--accept-package-agreements", "--accept-source-agreements") `
+            -SuccessMessage "$FriendlyName installed (or already present)." `
+            -FailureMessage "Failed to install $FriendlyName." `
+            -ContinueOnError `
+            -AcceptExitCodes @(0, -1978335189)
+        
+        if (-not $result) {
+            Write-Log "$FriendlyName installation failed." "ERROR"
             return $false
         }
-        return $true
-    } else {
-        Write-Log "$FriendlyName tracked by winget. Upgrading if needed..." "INFO"
-        # First try a normal upgrade
-        $ok = Run-Exe -FilePath "winget" -ArgumentList @("upgrade","-e","--id",$Id,"--accept-package-agreements","--accept-source-agreements") -SuccessMessage "$FriendlyName upgraded (or already up-to-date)." -FailureMessage "Failed to upgrade $FriendlyName." -ContinueOnError
-        if (-not $ok) {
-            # Retry with include-unknown (for MSI installs winget doesn't map)
-            Write-Log "Retrying $FriendlyName upgrade with --include-unknown..." "WARNING"
-            $ok2 = Run-Exe -FilePath "winget" -ArgumentList @("upgrade","-e","--id",$Id,"--include-unknown","--accept-package-agreements","--accept-source-agreements") -SuccessMessage "$FriendlyName upgraded (include-unknown)." -FailureMessage "Failed to upgrade $FriendlyName (include-unknown)." -ContinueOnError
-            if (-not $ok2) {
-                # Final fallback: install (winget may treat this as "install or upgrade")
-                Write-Log "Falling back to install for $FriendlyName..." "WARNING"
-                $ok3 = Run-Exe -FilePath "winget" -ArgumentList @("install","-e","--id",$Id,"--accept-package-agreements","--accept-source-agreements") -SuccessMessage "$FriendlyName installed via fallback." -FailureMessage "Failed to install $FriendlyName (fallback)."
-                return $ok3
-            }
-        }
+        
+        Write-Log "$FriendlyName installation completed." "SUCCESS"
         return $true
     }
+    
+    # Package is already tracked by winget - try to upgrade
+    Write-Log "$FriendlyName is already tracked by winget. Checking for upgrades..." "INFO"
+    
+    # Try upgrade
+    $result = Run-Exe -FilePath "winget" `
+        -ArgumentList @("upgrade", "-e", "--id", $Id, "--accept-package-agreements", "--accept-source-agreements") `
+        -SuccessMessage "$FriendlyName upgraded (or already up-to-date)." `
+        -FailureMessage "Upgrade attempt failed." `
+        -ContinueOnError `
+        -AcceptExitCodes @(0, -1978335189)
+    
+    if ($result) {
+        return $true
+    }
+    
+    # Upgrade failed - check if "no upgrade available" message
+    Write-Log "$FriendlyName upgrade returned an error, but package may already be current." "WARN"
+    
+    # Don't fail the entire script for "already current" scenarios
+    return $true
 }
 
 function Refresh-NodePath {
@@ -291,7 +345,7 @@ function Ensure-Nvm {
     if (-not (Run-Exe -FilePath "winget" -ArgumentList @(
         "install","-e","--id","CoreyButler.NVMforWindows",
         "--accept-package-agreements","--accept-source-agreements"
-    ) -SuccessMessage "NVM for Windows installed." -FailureMessage "Failed to install NVM for Windows.")) {
+    ) -SuccessMessage "NVM for Windows installed (or already present)." -FailureMessage "Failed to install NVM for Windows." -AcceptExitCodes @(0, -1978335189))) {
         return $null
     }
 

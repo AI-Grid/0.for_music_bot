@@ -10,17 +10,25 @@
     4.  Clones 'suno-automation' repository from GitHub.
     5.  Creates a Python virtual environment and installs dependencies without requiring activation.
     6.  Installs frontend dependencies using npm.
-    7.  Supports a -NonInteractive switch for CI/CD environments.
+    7.  Downloads Camoufox browser payload for web automation.
+    8.  Supports switches for CI/CD environments.
 .PARAMETER NonInteractive
     If specified, script will not prompt for user input at the end of execution.
+.PARAMETER SkipCamoufoxFetch
+    If specified, skips the Camoufox browser payload download (useful for CI/CD).
 .EXAMPLE
    .\setup-windows.ps1
 .EXAMPLE
    .\setup-windows.ps1 -NonInteractive
+.EXAMPLE
+   .\setup-windows.ps1 -SkipCamoufoxFetch
+.EXAMPLE
+   .\setup-windows.ps1 -NonInteractive -SkipCamoufoxFetch
 #>
 
 param(
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$SkipCamoufoxFetch
 )
 
 # --- Script Configuration ---
@@ -62,12 +70,16 @@ function Write-Log {
     )
     $logEntry = "[$Level] $Message"
     $color = @{
-        INFO    = "White"
-        WARN    = "Yellow"
-        ERROR   = "Red"
-        SUCCESS = "Green"
-        DEBUG   = "Gray"
+        INFO      = "White"
+        WARN      = "Yellow"
+        ERROR     = "Red"
+        SUCCESS   = "Green"
+        DEBUG     = "Gray"
+        IMPORTANT = "Cyan"
     }[$Level]
+    
+    # Fallback if level not found
+    if (-not $color) { $color = "White" }
 
     Write-Host $logEntry -ForegroundColor $color
     Add-Content -Path $LogFile -Value $logEntry
@@ -99,39 +111,76 @@ function Run-Exe {
         [string]$SuccessMessage = "",
         [string]$FailureMessage = "",
         [switch]$ContinueOnError,
-        [switch]$AttachConsole,   # NEW: Allow console-attached execution
-        [int[]]$AcceptExitCodes = @(0)   # NEW: Acceptable non-zero exit codes
+        [switch]$AttachConsole,
+        [int[]]$AcceptExitCodes = @(0),
+        [string]$WorkingDirectory,  # Working directory parameter
+        [int]$TimeoutSeconds = 0     # 0 = no timeout
     )
     Write-Log "Executing: $FilePath $($ArgumentList -join ' ')" "DEBUG"
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $FilePath
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow   = $true
+        $psi.WorkingDirectory = $(if ($WorkingDirectory) { $WorkingDirectory } else { (Get-Location).Path })
 
+        # If it's a .cmd/.bat (or a shell alias like 'npm'), run via cmd.exe
+        $ext = [IO.Path]::GetExtension($FilePath)
+        $isCmd = ($ext -in @(".cmd",".bat")) -or ($ext -eq "" -and (Get-Command "$FilePath.cmd" -ErrorAction SilentlyContinue))
+        
         if ($AttachConsole) {
-            # Share current console and DO NOT redirect.
-            $psi.UseShellExecute = $false
-            $psi.RedirectStandardOutput = $false
-            $psi.RedirectStandardError  = $false
-            $psi.CreateNoWindow = $true   # don't spawn a new console
+            $psi.RedirectStandardOutput = $false;
+            $psi.RedirectStandardError = $false
         } else {
-            # Old behavior: capture output for logging.
-            $psi.UseShellExecute = $false
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError  = $true
-            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true;
+            $psi.RedirectStandardError = $true
         }
 
-        foreach ($arg in $ArgumentList) { [void]$psi.ArgumentList.Add($arg) }
+        if ($isCmd -and -not $AttachConsole) {
+            $psi.FileName = "cmd.exe"
+
+            # Quote the .cmd path and any args that contain spaces
+            $quotedFile = '"' + $FilePath + '"'
+            $cmdArgs    = $ArgumentList | ForEach-Object {
+                if ($_ -match '[\s&()^<>|]') { '"' + ($_ -replace '"','\"') + '"' } else { $_ }
+            }
+            
+            # Build the full command line and wrap it in an extra pair of quotes
+            # This is the "double-double-quotes" pattern required by cmd.exe
+            $cmdLine = "$quotedFile $($cmdArgs -join ' ')"
+            $psi.Arguments = "/d /c ""$cmdLine"""
+        } else {
+            $psi.FileName = $FilePath
+            foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
+        }
 
         $p = New-Object System.Diagnostics.Process
         $p.StartInfo = $psi
         $null = $p.Start()
         if (-not $AttachConsole) {
-            $stdout = $p.StandardOutput.ReadToEnd()
+            $stdout = $p.StandardOutput.ReadToEnd();
             $stderr = $p.StandardError.ReadToEnd()
         }
-        $p.WaitForExit()
+        
+        # Handle timeout if specified
+        if ($TimeoutSeconds -gt 0) {
+            $completed = $p.WaitForExit($TimeoutSeconds * 1000)
+            if (-not $completed) {
+                Write-Log "Command exceeded $TimeoutSeconds second timeout. Terminating process..." "WARN"
+                try { $p.Kill() } catch {}
+                $p.WaitForExit()
+                Write-Log "$FailureMessage (Timeout)" "ERROR"
+                if (-not $ContinueOnError) {
+                    $script:blnSuccess = $false
+                    $script:strInstallReport += "$FailureMessage (timeout)`n"
+                }
+                return $false
+            }
+        } else {
+            $p.WaitForExit()
+        }
+        
         $code = $p.ExitCode
+
         if ($AcceptExitCodes -contains $code) {
             if ($SuccessMessage) { Write-Log $SuccessMessage "SUCCESS" }
             if (-not $AttachConsole) {
@@ -139,18 +188,18 @@ function Run-Exe {
                 if ($stderr.Trim()) { Write-Log "Err: $($stderr.Trim())" "DEBUG" }
             }
             return $true
-        } else {
-            Write-Log "$FailureMessage (Exit Code: $code)" "ERROR"
-            if (-not $AttachConsole) {
-                if ($stdout.Trim()) { Write-Log "Out: $($stdout.Trim())" "ERROR" }
-                if ($stderr.Trim()) { Write-Log "Err: $($stderr.Trim())" "ERROR" }
-            }
-            if (-not $ContinueOnError) {
-                $script:blnSuccess = $false
-                $script:strInstallReport += "$FailureMessage`n"
-            }
-            return $false
         }
+
+        Write-Log "$FailureMessage (Exit Code: $code)" "ERROR"
+        if (-not $AttachConsole) {
+            if ($stdout.Trim()) { Write-Log "Out: $($stdout.Trim())" "ERROR" }
+            if ($stderr.Trim()) { Write-Log "Err: $($stderr.Trim())" "ERROR" }
+        }
+        if (-not $ContinueOnError) {
+            $script:blnSuccess = $false
+            $script:strInstallReport += "$FailureMessage`n"
+        }
+        return $false
     } catch {
         Write-Log "$FailureMessage (Exception: $($_.Exception.Message))" "ERROR"
         if (-not $ContinueOnError) {
@@ -620,22 +669,44 @@ function Setup-Backend {
         Write-Log "Virtual environment already exists." "SUCCESS"
     }
 
-    # Use venv's python -m pip (most robust)
-    $venvPy = Join-Path (Resolve-Path ".\.venv\Scripts").Path "python.exe"
-    if (-not (Test-Path $venvPy)) {
-        Write-Log "venv python.exe not found." "ERROR"
+    # Find venv's Python with a short retry instead of immediate Resolve-Path
+    $venvPy = $null
+    for ($i=0; $i -lt 40 -and -not $venvPy; $i++) {
+        foreach ($c in @(
+            ".\.venv\Scripts\python.exe",
+            ".\.venv\Scripts\python3.exe",
+            ".\.venv\bin\python",
+            ".\.venv\bin\python3"
+        )) {
+            if (Test-Path $c) {
+                $venvPy = (Resolve-Path $c).Path;
+                break
+            }
+        }
+        if (-not $venvPy) {
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    if (-not $venvPy) {
+        Write-Log "venv python.exe not found (tried multiple locations)." "ERROR"
         $script:blnSuccess = $false
         $script:strInstallReport += "Failed to activate virtual environment`n"
         Pop-Location
         return
     }
+    
+    Write-Log "Using venv Python at: $venvPy" "DEBUG"
 
     # Upgrade pip
-    Run-Exe -FilePath $venvPy -ArgumentList @("-m", "pip", "install", "--upgrade", "pip") -SuccessMessage "Pip upgraded." -FailureMessage "Failed to upgrade pip." -ContinueOnError
+    Run-Exe -FilePath $venvPy -ArgumentList @("-m", "pip", "install", "--upgrade", "pip") `
+            -SuccessMessage "Pip upgraded." -FailureMessage "Failed to upgrade pip." `
+            -WorkingDirectory $backendPath -ContinueOnError
 
     # Install requirements
     if (Test-Path "requirements.txt") {
-        if (-not (Run-Exe -FilePath $venvPy -ArgumentList @("-m", "pip", "install", "-r", "requirements.txt") -SuccessMessage "Python dependencies installed." -FailureMessage "Failed to install Python dependencies.")) {
+        if (-not (Run-Exe -FilePath $venvPy -ArgumentList @("-m", "pip", "install", "-r", "requirements.txt") `
+                -SuccessMessage "Python dependencies installed." -FailureMessage "Failed to install Python dependencies." `
+                -WorkingDirectory $backendPath)) {
             Pop-Location
             return
         }
@@ -646,8 +717,24 @@ function Setup-Backend {
     # Camoufox fetch (if present)
     $camouPath = Join-Path (Split-Path $venvPy -Parent) "camoufox.exe"
     if (-not (Test-Path $camouPath)) { $camouPath = Join-Path (Split-Path $venvPy -Parent) "camoufox" }
-    if (Test-Path $camouPath) {
-        Run-Exe -FilePath $camouPath -ArgumentList @("fetch") -SuccessMessage "Camoufox payload downloaded." -FailureMessage "Failed to download Camoufox payload." -ContinueOnError
+    
+    if ($SkipCamoufoxFetch) {
+        Write-Log "Skipping Camoufox payload fetch by request. You can run 'camoufox fetch' later." "INFO"
+    } elseif (Test-Path $camouPath) {
+        Write-Log "Downloading Camoufox browser payload (~150MB). This may take 5-15 minutes..." "INFO"
+        Write-Host "  One-time download. Progress will appear below." -ForegroundColor Yellow
+        
+        # Use AttachConsole to show progress and set a 15-minute timeout
+        $result = Run-Exe -FilePath $camouPath -ArgumentList @("fetch") `
+            -SuccessMessage "Camoufox payload downloaded." `
+            -FailureMessage "Failed to download Camoufox payload." `
+            -AttachConsole `
+            -ContinueOnError `
+            -TimeoutSeconds 900  # 15 minute timeout
+        
+        if (-not $result) {
+            Write-Log "Camoufox fetch failed, but continuing setup. You can run 'camoufox fetch' later." "WARN"
+        }
     } else {
         Write-Log "Camoufox tool not found in the virtual environment. Skipping payload download." "WARNING"
     }
@@ -670,26 +757,44 @@ function Setup-Frontend {
     Write-Log "Changing directory to '$frontendPath'." "DEBUG"
     Push-Location $frontendPath
     
-    # Check npm availability
-    if (-not (Get-Command "npm" -ErrorAction SilentlyContinue)) {
-        Write-Log "npm not found on PATH. Please restart your terminal." "ERROR"
-        $script:blnSuccess = $false
-        $script:strInstallReport += "npm unavailable in current session`n"
-        Pop-Location
-        return
+    # Refresh Node path to ensure npm is available
+    Refresh-NodePath
+    
+    # Locate npm explicitly (NVM symlink)
+    $npmPath = "${env:ProgramFiles}\nodejs\npm.cmd"
+    if (-not (Test-Path $npmPath)) {
+        # Fallback: try to find npm via Get-Command
+        $npmCmd = Get-Command "npm" -ErrorAction SilentlyContinue
+        if ($npmCmd) {
+            $npmPath = $npmCmd.Source
+        } else {
+            Write-Log "npm not found on PATH. Please restart your terminal." "ERROR"
+            $script:blnSuccess = $false
+            $script:strInstallReport += "npm unavailable in current session`n"
+            Pop-Location
+            return
+        }
     }
     
+    Write-Log "Using npm at: $npmPath" "DEBUG"
+    
     # Configure npm
-    Run-Exe -FilePath "npm" -ArgumentList @("config","set","fund","false") -SuccessMessage "npm configured." -FailureMessage "Failed to configure npm." -ContinueOnError
+    Run-Exe -FilePath $npmPath -ArgumentList @("config","set","fund","false") `
+            -SuccessMessage "npm configured." -FailureMessage "Failed to configure npm." `
+            -WorkingDirectory $frontendPath -ContinueOnError
     
     # Install dependencies (use ci if lockfile exists)
     if (Test-Path "package-lock.json") {
-        if (-not (Run-Exe -FilePath "npm" -ArgumentList @("ci") -SuccessMessage "Node.js dependencies installed (ci)." -FailureMessage "Failed to install Node.js dependencies.")) {
+        if (-not (Run-Exe -FilePath $npmPath -ArgumentList @("ci") `
+                -SuccessMessage "Node.js dependencies installed (ci)." -FailureMessage "Failed to install Node.js dependencies." `
+                -WorkingDirectory $frontendPath)) {
             Pop-Location
             return
         }
     } else {
-        if (-not (Run-Exe -FilePath "npm" -ArgumentList @("install") -SuccessMessage "Node.js dependencies installed." -FailureMessage "Failed to install Node.js dependencies.")) {
+        if (-not (Run-Exe -FilePath $npmPath -ArgumentList @("install") `
+                -SuccessMessage "Node.js dependencies installed." -FailureMessage "Failed to install Node.js dependencies." `
+                -WorkingDirectory $frontendPath)) {
             Pop-Location
             return
         }

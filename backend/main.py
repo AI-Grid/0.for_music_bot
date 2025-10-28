@@ -10,6 +10,7 @@ from typing import List
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from api.chat.routes import router as chat_router
 from api.song.routes import router as song_router
 from api.ai_review.routes import router as ai_review_router
 from api.ai_generation.routes import router as ai_generation_router
@@ -41,6 +42,7 @@ app.add_middleware(
 
 # Include routers AFTER CORS middleware
 app.include_router(song_router)
+app.include_router(chat_router)
 app.include_router(ai_review_router)
 app.include_router(ai_generation_router)
 app.include_router(orchestrator_router)

@@ -228,6 +228,7 @@ docker-compose up -d
 - **MP3 download and storage** in local folders
 - **Web interface** at http://localhost:3000
 - **API access** at http://localhost:8000
+- **OpenAI-style chat API** at http://localhost:8080/v1/chat/completions secured with API keys and optional Discord password
 - **Persistent data** across restarts
 - **No technical knowledge required** for basic usage
 

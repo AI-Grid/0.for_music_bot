@@ -56,6 +56,24 @@ services:
     networks:
       - suno-network
 
+  php-gateway:
+    build:
+      context: ./php
+      dockerfile: Dockerfile
+    container_name: suno-php-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      - BACKEND_BASE_URL=http://backend:8000
+      - BACKEND_CHAT_API_KEY=${CHAT_API_KEY}
+      - GATEWAY_CLIENT_API_KEY=${GATEWAY_CLIENT_API_KEY}
+      - DISCORD_BOT_PASSWORD=${DISCORD_BOT_PASSWORD}
+    depends_on:
+      - backend
+    networks:
+      - suno-network
+
 networks:
   suno-network:
     driver: bridge
